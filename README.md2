@@ -1,0 +1,276 @@
+{
+  "name": "saby-medium-backend",
+  "version": "0.1.0",
+  "description": "Backend minimal Saby Médium (node + express + prisma + stripe)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "bcrypt": "^5.1.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "stripe": "^12.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.0",
+    "prisma": "^5.0.0"
+  }
+}
+// Fichier principal minimal - index.js
+require('dotenv').config();
+const express = require('express');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+const authRoutes = require('./routes/auth');
+const walletRoutes = require('./routes/wallet');
+const stripeRoutes = require('./routes/stripe');
+
+const app = express();
+
+// Important: stripe webhook route uses express.raw in its file; for the rest we use json
+app.use(express.json());
+
+// Routes
+app.use('/auth', authRoutes);
+app.use('/wallet', walletRoutes);
+app.use('/stripe', stripeRoutes);
+
+app.get('/', (req, res) => res.json({ name: 'Saby Médium API', status: 'ok' }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Saby Médium backend listening on ${port}`);
+});
+// routes/auth.js
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+
+const router = express.Router();
+const SALT_ROUNDS = 10;
+
+function signToken(userId) {
+  return jwt.sign({ userId }, process.env.JWT_SECRET || 'devsecret', { expiresIn: '30d' });
+}
+
+router.post('/signup', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) return res.status(400).json({ error: 'Email already used' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 chars' });
+
+    const hash = await bcrypt.hash(password, SALT_ROUNDS);
+    const user = await prisma.user.create({
+      data: { name, email, passwordHash: hash, role: 'CLIENT' }
+    });
+
+    await prisma.wallet.create({ data: { userId: user.id, balanceCents: 0 } });
+
+    const token = signToken(user.id);
+    res.status(201).json({ user: { id: user.id, email: user.email, name: user.name }, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = signToken(user.id);
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+module.exports = router;
+// routes/wallet.js
+const express = require('express');
+const Stripe = require('stripe');
+const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+const router = express.Router();
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-11-01' });
+
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing authorization header' });
+  const token = auth.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'devsecret');
+    req.userId = payload.userId;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// GET /wallet/balance
+router.get('/balance', requireAuth, async (req, res) => {
+  const userId = req.userId;
+  const wallet = await prisma.wallet.findUnique({ where: { userId } });
+  if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
+  res.json({ balanceCents: wallet.balanceCents, currency: 'EUR' });
+});
+
+// POST /wallet/topup { amount: 10 } (amount in euros)
+router.post('/topup', requireAuth, async (req, res) => {
+  const { amount } = req.body;
+  if (!amount || amount < 10) return res.status(400).json({ error: 'Minimum top-up 10€' });
+  const userId = req.userId;
+
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: 'eur',
+      payment_method_types: ['card'],
+      metadata: { userId },
+      description: `Top-up Saby Médium for user ${userId}`
+    });
+    res.json({ client_secret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+  } catch (err) {
+    console.error('Stripe error', err);
+    res.status(500).json({ error: 'Stripe error' });
+  }
+});
+
+module.exports = router;
+// routes/stripe.js
+const express = require('express');
+const Stripe = require('stripe');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+require('dotenv').config();
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-11-01' });
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
+
+const router = express.Router();
+
+// Use express.raw for webhook signature verification
+router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  if (!sig) return res.status(400).send('Missing stripe signature');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'payment_intent.succeeded') {
+      const pi = event.data.object;
+      const paymentIntentId = pi.id;
+      const amount = pi.amount || 0;
+      const metadata = pi.metadata || {};
+      const userId = metadata.userId;
+
+      if (!userId) {
+        console.warn('payment_intent.succeeded missing metadata.userId, skipping');
+      } else {
+        // Idempotent: check if transaction exists
+        const existing = await prisma.transaction.findFirst({ where: { paymentIntentId } });
+        if (!existing) {
+          // find or create wallet
+          let wallet = await prisma.wallet.findUnique({ where: { userId } });
+          if (!wallet) {
+            wallet = await prisma.wallet.create({ data: { userId, balanceCents: 0 } });
+          }
+          await prisma.wallet.update({ where: { id: wallet.id }, data: { balanceCents: wallet.balanceCents + amount } });
+          await prisma.transaction.create({
+            data: {
+              walletId: wallet.id,
+              type: 'topup',
+              amountCents: amount,
+              paymentIntentId,
+              metadata: { stripe: pi }
+            }
+          });
+          console.log(`Credited ${amount} cents to wallet ${wallet.id}`);
+        } else {
+          console.log(`PaymentIntent ${paymentIntentId} already processed`);
+        }
+      }
+    } else {
+      console.log(`Unhandled event type ${event.type}`);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Error in webhook handler', err);
+    res.status(500).send('Server error');
+  }
+});
+
+module.exports = router;
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String?
+  email        String   @unique
+  passwordHash String?
+  role         UserRole @default(CLIENT)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  wallet       Wallet?
+}
+
+model Wallet {
+  id           String  @id @default(uuid())
+  user         User    @relation(fields: [userId], references: [id])
+  userId       String  @unique
+  balanceCents Int     @default(0)
+  transactions Transaction[]
+  updatedAt    DateTime @updatedAt
+}
+
+model Transaction {
+  id              String   @id @default(uuid())
+  wallet          Wallet   @relation(fields: [walletId], references: [id])
+  walletId        String
+  type            String
+  amountCents     Int
+  paymentIntentId String?
+  metadata        Json?
+  createdAt       DateTime @default(now())
+}
+
+enum UserRole {
+  CLIENT
+  READER
+  ADMIN
+}
+# Exemple .env - NE PAS committer de vraies clés publiquement
+DATABASE_URL=postgresql://postgres:postgres@db:5432/saby_medium
+JWT_SECRET=change_this_to_a_secure_value
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+PORT=3000
